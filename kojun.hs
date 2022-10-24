@@ -1,136 +1,115 @@
-{-# OPTIONS_GHC -fglasgow-exts #-}
+module Main where
 
--- Solve a Sudoku puzzle
+import Reader
+import Matrix
+import Data.List
 
-module Sudoku where
+type Choices = [Value]
 
-import Control.Monad.State
-import Data.Maybe (maybeToList)
-import Data.List (delete)
+-- Solucao baseada na de Graham Hutton. 
+-- Disponível em: http://www.cs.nott.ac.uk/~pszgmh/sudoku.lhs
 
-type Value = Int
-type Cell = (Int, Int) -- One-based coordinates
+-- Recebe a matriz de valores e de posições lida do documento de texto.
+-- Retorna a primeira solução encontrada para o tabuleiro.
+solve :: Grid -> Grid -> Grid
+solve vals pos = (search (prune (choices vals pos) pos) pos)!!0
 
-type Puzzle  = [[Maybe Value]]
-type Solution = [[Value]]
+-- Recebe uma matriz de valores e a matriz de posições.
+-- Retorna uma matriz de escolhas.
+-- Preenche cada celula sem valor com uma lista contendo valores possíveis para aquela célula.
+-- Essa lista vai de 1 até o tamanho do bloco correspondente a célula, excluindo valores pré-existentes no bloco.
+choices :: Grid -> Grid -> Matrix Choices
+choices vals pos = map (map choice) (zipWith zip vals pos)
+    where choice (v, p) = if v == 0 then [1..(lengthOfBlock p pos)] `minus` (valsOfBlock vals pos p) else [v]
 
--- The size of the puzzle.
-sqrtSize :: Int
-sqrtSize = 3
-size = sqrtSize * sqrtSize
+-- Recebe uma matriz de escolhas e a matriz de posições.
+-- Aplica a função reduce para cada coluna dividida por blocos.
+-- Retorna essa matriz de escolhas com escolhas reduzidas.
+prune :: Matrix Choices -> Grid -> Matrix Choices
+prune vals pos = cols $ colsOfBlocksByCols (map reduce (blocksByCols vals pos)) (size vals)
 
--- Besides the rows and columns, a Sudoku puzzle contains s blocks
--- of s cells each, where s = size.
-blocks :: [[Cell]]
-blocks = [[(x + i, y + j) | i <- [1..sqrtSize], j <- [1..sqrtSize]] |
-          x <- [0,sqrtSize..size-sqrtSize],
-          y <- [0,sqrtSize..size-sqrtSize]]
+-- De uma linha contendo escolhas, reduz as escolhas com base em elementos unitários
+-- ex: ["1 2 3 4", "1", "3 4", "3"] -> ["2 4", "1", "4", "3"]
+reduce :: Row Choices -> Row Choices
+reduce xss = [xs `minus` singles | xs <- xss]
+    where singles = concat (filter single xss)
 
--- The one-based number of the block that a cell is contained in.
-blockNum :: Cell -> Int
-blockNum (row, col) = row - (row - 1) `mod` sqrtSize + (col - 1) `div` sqrtSize
+minus :: Choices -> Choices -> Choices
+xs `minus` ys = if single xs then xs else xs \\ ys
 
--- When a Sudoku puzzle has been partially filled in, the following
--- data structure represents the remaining options for how to proceed.
-data Options = Options {
-    cellOpts :: [[[Value]]], -- For each cell, a list of possible values
-    rowOpts  :: [[[Cell ]]], -- For each row    and value, a list of cells
-    colOpts  :: [[[Cell ]]], -- For each column and value, a list of cells
-    blkOpts  :: [[[Cell ]]]  -- For each block  and value, a list of cells
-  } deriving Show
-modifyCellOpts f = do {opts <- get; put $ opts {cellOpts = f $ cellOpts opts}}
-modifyRowOpts  f = do {opts <- get; put $ opts {rowOpts  = f $ rowOpts  opts}}
-modifyColOpts  f = do {opts <- get; put $ opts {colOpts  = f $ colOpts  opts}}
-modifyBlkOpts  f = do {opts <- get; put $ opts {blkOpts  = f $ blkOpts  opts}}
+-- Retorna true se a lista passada só possui um elemento
+single :: [a] -> Bool
+single [_] = True
+single _ = False
 
--- The full set of initial options, before any cells are constrained
-initOptions :: Options
-initOptions = Options {
-  cellOpts = [[[1..size] | _ <- [1..size]] | _ <- [1..size]],
-  rowOpts  = [[[(r, c)   | c <- [1..size]] | _ <- [1..size]] | r <- [1..size]],
-  colOpts  = [[[(r, c)   | r <- [1..size]] | _ <- [1..size]] | c <- [1..size]],
-  blkOpts  = [[b         | _ <- [1..size]] | b <- blocks]}
+-- Recebe uma matriz de escolhas e a matriz de posições.
+-- Retorna uma lista que contém soluções válidas para o tabuleiro.
+-- A ideia desse algoritmo é de que filtre todas as escolhas possíveis, uma célula por vez,
+-- e retorne somente matrizes que contém escolhas válidas.
+search :: Matrix Choices -> Grid -> [Grid]
+search vals pos
+    -- nao retorna nada se a matriz de escolhas passada não pode fornecer uma solução
+    | blocked vals pos = []
+    -- se a matriz de escolhas passada é válida e só contém valores unitários, é uma solução,
+    -- portanto, extrai o valor de cada lista de escolhas e retorna.
+    | all (all single) vals = [map concat vals]
+    -- se a matriz de escolhas passada é valida e contém mais de uma escolha para pelo menos uma célula,
+    -- expande a matriz, reduz o número de escolhas restantes e continua o processo de busca sobre ela.
+    | otherwise = [g | vals' <- expand vals, g <- search (prune vals' pos) pos]
 
-solve :: Puzzle -> [Solution]
-solve puz = evalStateT (initPuzzle >> solutions) initOptions
-  where
-    initPuzzle =
-      sequence_ [fixCell v (r, c) | (row, r) <- zip puz [1..],
-                                    (val, c) <- zip row [1..],
-                                    v <- maybeToList val]
+-- Recebe uma matriz de escolhas e a matriz de posições.
+-- Retorna true se a matriz de escolhas passada nunca pode fornecer uma solução.
+blocked :: Matrix Choices -> Grid -> Bool
+blocked vals pos = void vals || not (safe vals pos)
 
--- Build a list of all possible solutions given the current options.
--- We use a list monad INSIDE a state monad. That way,
--- the state is re-initialized on each element of the list iteration,
--- allowing backtracking when an attempt fails (with mzero).
-solutions :: StateT Options [] Solution
-solutions = solveFromRow 1
-  where
-    solveFromRow r
-     | r > size  = return []
-     | otherwise = do
-         row  <- solveRowFromCol r 1
-         rows <- solveFromRow $ r + 1
-         return $ row : rows
-    solveRowFromCol r c
-     | c > size  = return []
-     | otherwise = do
-         vals <- gets $ (!! (c - 1)) . (!! (r - 1)) . cellOpts
-         val <- lift vals
-         fixCell val (r, c)
-         row <- solveRowFromCol r (c + 1)
-         return $ val : row
+-- Verifica se ha alguma celula vazia na matriz
+void :: Matrix Choices -> Bool
+void m = any (any null) m
 
--- Fix the value of a cell.
--- More specifically - update Options to reflect the given value at
--- the given cell, or mzero if that is not possible.
-fixCell :: (MonadState Options m, MonadPlus m) =>
-           Value -> Cell -> m ()
-fixCell val cell@(row, col) = do
-    vals <- gets $ (!! (col - 1)) . (!! (row - 1)) . cellOpts
-    guard $ val `elem` vals
-    modifyCellOpts $ replace2 row col [val]
-    modifyRowOpts  $ replace2 row val [cell]
-    modifyColOpts  $ replace2 col val [cell]
-    modifyBlkOpts  $ replace2 blk val [cell]
-    sequence_ [constrainCell v   cell     | v <- [1..size], v /= val]
-    sequence_ [constrainCell val (row, c) | c <- [1..size], c /= col]
-    sequence_ [constrainCell val (r, col) | r <- [1..size], r /= row]
-    sequence_ [constrainCell val c | c <- blocks !! (blk - 1), c /= cell]
-  where
-    blk = blockNum cell
+-- Recebe uma matriz de escolhas e a matriz de posições.
+-- Retorna true se as matrizes passam nos seguintes testes:
+-- -- Cada célula não possui vizinhos com o mesmo valor;
+-- -- Cada bloco não possui valores duplicados;
+-- -- Cada bloco respeita a ordem de valores decrescentes na vertical.
+safe :: Matrix Choices -> Grid -> Bool
+safe vals pos = all (validNeighborhood) (cols vals) &&
+        all (validNeighborhood) (rows vals) &&
+        all (nodups) (blocks vals pos) &&
+        all (isDecreasing) (blocksByCols vals pos)
 
--- Assert that the given value cannot occur in the given cell.
--- Fail with mzero if that means that there are no options left.
-constrainCell :: (MonadState Options m, MonadPlus m) =>
-                 Value -> Cell -> m ()
-constrainCell val cell@(row, col) = do
-    constrainOpts row col val  cellOpts modifyCellOpts (flip fixCell cell)
-    constrainOpts row val cell rowOpts  modifyRowOpts  (fixCell val)
-    constrainOpts col val cell colOpts  modifyColOpts  (fixCell val)
-    constrainOpts blk val cell blkOpts  modifyBlkOpts  (fixCell val)
-  where
-    blk = blockNum cell
-    constrainOpts x y z getOpts modifyOpts fixOpts = do
-      zs <- gets $ (!! (y - 1)) . (!! (x - 1)) . getOpts
-      case zs of
-        [z']  -> guard (z' /= z)
-        [_,_] -> when (z `elem` zs) $ fixOpts (head $ delete z zs)
-        (_:_) -> modifyOpts $ replace2 x y (delete z zs)
-        _     -> mzero
+-- Verifica se nao ha valores unitarios vizinhos iguais
+validNeighborhood :: Eq a => Row [a] -> Bool
+validNeighborhood [] = True
+validNeighborhood [a] = True
+validNeighborhood (a:b:bs) 
+    | (length a <= 1) && (length b <= 1) = if a == b then False else validNeighborhood (b:bs)
+    | otherwise = validNeighborhood (b:bs)
 
--- Replace one element of a list.
--- Coordinates are 1-based.
-replace :: Int -> a -> [a] -> [a]
-replace i x (y:ys)
- | i > 1     = y : replace (i - 1) x ys
- | otherwise = x : ys
-replace _ _ _ = []
+-- Verifica se não há valores unitarios duplicados na linha passada
+nodups :: Eq a => Row [a] -> Bool
+nodups [] = True
+nodups (x:xs) = if (length x <= 1) then not (elem x xs) && nodups xs else nodups xs
 
--- Replace one element of a 2-dimensional list.
--- Coordinates are 1-based.
-replace2 :: Int -> Int -> a -> [[a]] -> [[a]]
-replace2 i j x (y:ys)
- | i > 1     = y : replace2 (i - 1) j x ys
- | otherwise = replace j x y : ys
-replace2 _ _ _ _ = []
+-- Verifica se os valores unitários da linha passada estão em ordem decrescente
+isDecreasing :: Ord a => Row [a] -> Bool
+isDecreasing [] = True
+isDecreasing [a] = True
+isDecreasing (a:b:bs) 
+    | (length a <= 1) && (length b <= 1) = if a < b then False else isDecreasing (b:bs)
+    | otherwise = isDecreasing (b:bs)
+
+-- Expand funciona de modo similar à collapse. A diferença é que faz o collapse
+-- apenas para a primeira célula que contém mais de uma escolha.
+expand :: Matrix Choices -> [Matrix Choices]
+expand m = [rows1 ++ [row1 ++ [c] : row2] ++ rows2 | c <- cs]
+    where
+        (rows1,row:rows2) = break (any (not . single)) m
+        (row1,cs:row2) = break (not . single) row
+
+main = do
+    putStrLn "Insira o path do tabuleiro (ex.: Tabuleiros/tabuleiro10x10.txt):"
+    board <- getLine
+    (vals, pos) <- readPuzzle board
+    let solutions = solve vals pos
+    putStrLn "Solucao:"
+    mapM_ print solutions
